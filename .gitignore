@@ -3,6 +3,7 @@
 __pycache__/
 *-checkpoint.ipynb
 .venv
+.venv-macos/
 *.egg*
 build/*
 _C.*
@@ -11,3 +12,4 @@ _C.*
 outputs/*
 checkpoints/*.pt
 *.pt
+app_cuda_original.py

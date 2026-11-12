@@ -12,6 +12,7 @@ import multiprocessing as mp
 import platform
 import os
 from os.path import basename, splitext, dirname
+from pathlib import Path
 import threading
 import time
 os.environ["TORCH_CUDNN_SDPA_ENABLED"] = "1"
@@ -27,6 +28,17 @@ from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.build_sam import build_sam2_video_predictor
 import cv2
+from omegaconf import OmegaConf
+
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
+print(f"MedSAM2 device: {DEVICE}")
 
 
 user_processes = {}
@@ -41,7 +53,10 @@ def reset(seg_tracker):
         del image_predictor
         del seg_tracker
         gc.collect()
-        torch.cuda.empty_cache()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        elif DEVICE == "mps":
+            torch.mps.empty_cache()
     return None, ({}, {}), None, None, 0, None, None, None, 0, 0, 
 
 def extract_video_info(input_video):
@@ -52,6 +67,55 @@ def extract_video_info(input_video):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     return fps, total_frames, None, None, None, None, None
+
+def _run_ffmpeg_frame_extraction(
+    input_video, output_dir, frame_interval, *, input_args
+):
+    ffmpeg.input(input_video, **input_args).output(
+        os.path.join(output_dir, "%07d.jpg"),
+        q=2,
+        start_number=0,
+        vf=rf"select=not(mod(n\,{frame_interval}))",
+        fps_mode="vfr",
+    ).run()
+
+
+def extract_video_frames(input_video, output_dir, frame_interval, device=DEVICE):
+    try:
+        _run_ffmpeg_frame_extraction(
+            input_video,
+            output_dir,
+            frame_interval,
+            input_args={"hwaccel": "cuda"} if device == "cuda" else {},
+        )
+    except ffmpeg.Error:
+        if device != "cuda":
+            raise
+        print("FFmpeg CUDA decoding failed; retrying on CPU")
+        _run_ffmpeg_frame_extraction(
+            input_video, output_dir, frame_interval, input_args={}
+        )
+
+
+def get_inference_config_files(config_dir):
+    config_files = []
+    for config_file in Path(config_dir).glob("*.yaml"):
+        config = OmegaConf.load(config_file)
+        if config.get("model", {}).get("_target_") == (
+            "sam2.modeling.sam2_base.SAM2Base"
+        ):
+            config_files.append(config_file)
+    return sorted(
+        config_files,
+        key=lambda path: (path.name != "sam2.1_hiera_t512.yaml", path.name),
+    )
+
+def get_sam2_config_name(config_path):
+    package_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "sam2"))
+    resolved_config = os.path.realpath(os.fspath(config_path))
+    if os.path.commonpath([package_root, resolved_config]) != package_root:
+        raise ValueError(f"SAM2 config must be inside {package_root}: {config_path}")
+    return os.path.relpath(resolved_config, package_root).replace(os.sep, "/")
 
 def get_meta_from_video(session_id, input_video, scale_slider, config_path, checkpoint_path):
     output_dir = f'/tmp/output_frames/{session_id}'
@@ -68,29 +132,25 @@ def get_meta_from_video(session_id, input_video, scale_slider, config_path, chec
     cap.release()
     frame_interval = max(1, int(fps // scale_slider))
     print(f"frame_interval: {frame_interval}")
-    try:
-        ffmpeg.input(input_video, hwaccel='cuda').output(
-            os.path.join(output_dir, '%07d.jpg'), q=2, start_number=0, 
-            vf=rf'select=not(mod(n\,{frame_interval}))', vsync='vfr'
-        ).run()
-    except:
-        print(f"ffmpeg cuda err")
-        ffmpeg.input(input_video).output(
-            os.path.join(output_dir, '%07d.jpg'), q=2, start_number=0, 
-            vf=rf'select=not(mod(n\,{frame_interval}))', vsync='vfr'
-        ).run()
+    extract_video_frames(input_video, output_dir, frame_interval)
 
     first_frame_path = os.path.join(output_dir, '0000000.jpg')
     first_frame = cv2.imread(first_frame_path)
     first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
 
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-    if torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-   
-    predictor = build_sam2_video_predictor(config_path, checkpoint_path, device="cuda")
-    sam2_model = build_sam2(config_path, checkpoint_path, device="cuda")
+    if DEVICE == "cuda":
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        if torch.cuda.get_device_properties(0).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    config_name = get_sam2_config_name(config_path)
+    predictor = build_sam2_video_predictor(
+        config_name, checkpoint_path, device=DEVICE
+    )
+    sam2_model = build_sam2(
+        config_name, checkpoint_path, device=DEVICE
+    )
     image_predictor = SAM2ImagePredictor(sam2_model)
     inference_state = predictor.init_state(video_path=output_dir)
     predictor.reset_state(inference_state)
@@ -650,25 +710,20 @@ def seg_track_app():
         config_path = os.path.abspath(os.environ.get("CONFIG_PATH", "sam2/configs/"))
         checkpoint_path = os.environ.get("CHECKPOINT_PATH", "checkpoints/")
 
-        config_files = glob(os.path.join(config_path, "*.yaml"))
-        config_files.sort(key=lambda x: '_t.' not in basename(x))
-
         checkpoint_files = glob(os.path.join(checkpoint_path, "*.pt"))
         checkpoint_files.sort(key=lambda x: 'tiny' not in basename(x))
 
         medsam_checkpoints = glob("checkpoints/*.pt")
     else:
-        config_path = "/" + os.path.abspath(os.environ.get("CONFIG_PATH", "./sam2/configs/"))
+        config_path = os.path.abspath(os.environ.get("CONFIG_PATH", "./sam2/configs/"))
         checkpoint_path = os.environ.get("CHECKPOINT_PATH", "./checkpoints")
-
-        config_files = glob(os.path.join(config_path, "*.yaml"))
-        config_files.sort(key=lambda x: '_t.' not in basename(x))
 
         checkpoint_files = glob(os.path.join(checkpoint_path, "*.pt"))
         checkpoint_files.sort(key=lambda x: 'tiny' not in basename(x))
 
         medsam_checkpoints = glob("./checkpoints/*.pt")
 
+    config_files = get_inference_config_files(config_path)
     config_display = [splitext(basename(f))[0] for f in config_files]
     medsam_display = [
         f"{os.path.basename(dirname(dirname(path)))} / {splitext(basename(path))[0]}"
